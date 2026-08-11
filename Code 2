@@ -1,0 +1,2773 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import tarfile
+import urllib.request
+import pandas as pd
+from tqdm import tqdm
+
+# Configure device accelerator synchronization
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device designated for execution:", device)
+
+# Initialize global hyperparameter configurations for FactFormer benchmark
+CONFIG = {
+    "dataset_resolution": 64,
+    "working_resolution": 8,
+    "train_samples": 200,
+    "test_samples": 50,
+    "batch_size": 8,
+    "epochs_list": [20, 50, 100],
+    "learning_rates": [1e-2, 1e-3, 1e-4],
+}
+
+WORKING_RESOLUTION = CONFIG["working_resolution"]
+
+os.makedirs("darcy_project/data", exist_ok=True)
+url = "https://zenodo.org/records/10994262/files/darcy_64.tgz"
+data_path = "darcy_project/data/darcy_64.tgz"
+
+if not os.path.exists(data_path):
+    print("Downloading dataset...")
+    urllib.request.urlretrieve(url, data_path)
+
+with tarfile.open(data_path, "r:gz") as tar:
+    tar.extractall("darcy_project/data/")
+
+# Sanity Check 1: Verify data files exist on disk before loading
+assert os.path.exists("darcy_project/data/darcy_train_64.pt"), "Data Error: Training file missing from extracted files"
+assert os.path.exists("darcy_project/data/darcy_test_64.pt"), "Data Error: Testing file missing from extracted files"
+
+train_data = torch.load("darcy_project/data/darcy_train_64.pt", map_location="cpu")
+test_data = torch.load("darcy_project/data/darcy_test_64.pt", map_location="cpu")
+
+if isinstance(train_data, dict):
+    x_train, y_train = train_data["x"], train_data["y"]
+    x_test, y_test = test_data["x"], test_data["y"]
+else:
+    x_train, y_train = train_data
+    x_test, y_test = test_data
+
+# Sanity Check 2: Check dimension alignment between matching branch and target arrays
+assert x_train.shape[0] == y_train.shape[0], f"Data Mismatch: Train X samples ({x_train.shape[0]}) != Train Y samples ({y_train.shape[0]})"
+assert x_test.shape[0] == y_test.shape[0], f"Data Mismatch: Test X samples ({x_test.shape[0]}) != Test Y samples ({y_test.shape[0]})"
+
+# Sanity Check 3: Minimum resolution verification against CONFIG settings
+assert x_train.shape[-1] >= CONFIG["dataset_resolution"], f"Data Resolution Error: Expected at least resolution {CONFIG['dataset_resolution']}, got {x_train.shape[-1]}"
+
+print("Raw training tensor shapes:", x_train.shape, y_train.shape)
+print("Raw testing tensor shapes:", x_test.shape, y_test.shape)
+print("Data ingestion pipeline complete. 3 sanity checks passed.")
+
+def downsample_fields(x, y, size):
+    if x.ndim == 3: x = x.unsqueeze(1)
+    if y.ndim == 3: y = y.unsqueeze(1)
+    x = F.interpolate(x.float(), size=(size, size), mode="bilinear", align_corners=False)
+    y = F.interpolate(y.float(), size=(size, size), mode="bilinear", align_corners=False)
+    return x, y
+
+# Execute bilinear interpolation downsampling
+x_train_ds, y_train_ds = downsample_fields(x_train, y_train, WORKING_RESOLUTION)
+x_test_ds, y_test_ds = downsample_fields(x_test, y_test, WORKING_RESOLUTION)
+
+# Sanity Check 1: Verify downsampled grid dimensions match target WORKING_RESOLUTION
+assert x_train_ds.shape[2:] == (WORKING_RESOLUTION, WORKING_RESOLUTION), f"x_train spatial resolution is {x_train_ds.shape[2:]}, expected {(WORKING_RESOLUTION, WORKING_RESOLUTION)}"
+assert y_train_ds.shape[2:] == (WORKING_RESOLUTION, WORKING_RESOLUTION), f"y_train spatial resolution is {y_train_ds.shape[2:]}, expected {(WORKING_RESOLUTION, WORKING_RESOLUTION)}"
+
+# Compute mean and standard deviation strictly from the training distribution
+x_mean, x_std = x_train_ds.mean(), x_train_ds.std()
+y_mean, y_std = y_train_ds.mean(), y_train_ds.std()
+
+# Sanity Check 2: Avoid division by zero bugs with a standard deviation safety check
+assert x_std > 1e-7, "Statistical Error: x_std is zero or negative. Check input dataset integrity."
+assert y_std > 1e-7, "Statistical Error: y_std is zero or negative. Check input dataset integrity."
+
+# Apply z-score normalization transformation
+x_train_norm = (x_train_ds - x_mean) / x_std
+x_test_norm = (x_test_ds - x_mean) / x_std
+y_train_norm = (y_train_ds - y_mean) / y_std
+y_test_norm = (y_test_ds - y_mean) / y_std
+
+# Slice datasets down to configured experiment limits
+x_train_sliced = x_train_norm[:CONFIG["train_samples"]]
+y_train_sliced = y_train_norm[:CONFIG["train_samples"]]
+x_test_sliced = x_test_norm[:CONFIG["test_samples"]]
+y_test_sliced = y_test_norm[:CONFIG["test_samples"]]
+
+# Sanity Check 3: Confirm sliced arrays match the target configuration numbers exactly
+assert len(x_train_sliced) == CONFIG["train_samples"], f"Sample Mismatch: Expected {CONFIG['train_samples']} train samples, got {len(x_train_sliced)}"
+assert len(x_test_sliced) == CONFIG["test_samples"], f"Sample Mismatch: Expected {CONFIG['test_samples']} test samples, got {len(x_test_sliced)}"
+
+def create_grid(resolution):
+    x = torch.linspace(0, 1, resolution)
+    y = torch.linspace(0, 1, resolution)
+    grid_x, grid_y = torch.meshgrid(x, y, indexing="ij")
+    return torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
+
+grid = create_grid(WORKING_RESOLUTION).numpy().astype(np.float32)
+
+# Sanity Check 4: Check coordinate point grid layout dimensions
+expected_grid_shape = (WORKING_RESOLUTION**2, 2)
+assert grid.shape == expected_grid_shape, f"Grid Shape Mismatch: Got {grid.shape}, expected {expected_grid_shape}"
+
+# Flatten high-dimensional fields into input vectors for operator channels
+branch_train = x_train_sliced.reshape(len(x_train_sliced), -1).numpy().astype(np.float32)
+branch_test = x_test_sliced.reshape(len(x_test_sliced), -1).numpy().astype(np.float32)
+target_train = y_train_sliced.reshape(len(y_train_sliced), -1).numpy().astype(np.float32)
+target_test = y_test_sliced.reshape(len(y_test_sliced), -1).numpy().astype(np.float32)
+
+# Sanity Check 5: Verify flattened vector matrix configurations
+assert branch_train.shape == (CONFIG["train_samples"], WORKING_RESOLUTION**2), f"Flattening Error: Branch train shape is {branch_train.shape}"
+assert target_train.shape == (CONFIG["train_samples"], WORKING_RESOLUTION**2), f"Flattening Error: Target train shape is {target_train.shape}"
+
+class OperatorDataset(Dataset):
+    def __init__(self, branch_data, target_data):
+        self.branch_data = torch.tensor(branch_data, dtype=torch.float32)
+        self.target_data = torch.tensor(target_data, dtype=torch.float32)
+    def __len__(self):
+        return len(self.branch_data)
+    def __getitem__(self, idx):
+        return self.branch_data[idx], self.target_data[idx]
+
+train_dataset = OperatorDataset(branch_train, target_train)
+test_dataset = OperatorDataset(branch_test, target_test)
+
+train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False)
+
+# Sanity Check 6: Pipeline test loop check over data stream batching
+mock_x, mock_y = next(iter(train_loader))
+assert mock_x.shape == (CONFIG["batch_size"], WORKING_RESOLUTION**2), f"DataLoader Error: Batch input shape is {mock_x.shape}"
+assert mock_y.shape == (CONFIG["batch_size"], WORKING_RESOLUTION**2), f"DataLoader Error: Batch target shape is {mock_y.shape}"
+
+print("Data processing pipeline complete. All 6 sanity checks passed cleanly.")
+print(f"Total Batches -> Train: {len(train_loader)} | Test: {len(test_loader)}")
+
+class AxialMultiHeadAttention(nn.Module):
+    """
+    Computes 1D multi-head self-attention along a designated spatial axis (H or W).
+    Reduces 2D spatial attention complexity from O((H*W)^2) to O(H*W^2 + W*H^2).
+    """
+    def __init__(self, embed_dim, heads=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.heads = heads
+        self.head_dim = embed_dim // heads
+
+        assert self.head_dim * heads == embed_dim, "FactFormer Error: embed_dim must be cleanly divisible by heads count"
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x, axis=1):
+        # x shape: [B, H, W, C]
+        B, H, W, C = x.shape
+
+        if axis == 1: # Attention along H (Height) axis
+            # Reshape [B, H, W, C] -> [B * W, H, C]
+            x_perm = x.permute(0, 2, 1, 3).reshape(B * W, H, C)
+            seq_len = H
+            batch_stride = B * W
+        elif axis == 2: # Attention along W (Width) axis
+            # Reshape [B, H, W, C] -> [B * H, W, C]
+            x_perm = x.reshape(B * H, W, C)
+            seq_len = W
+            batch_stride = B * H
+        else:
+            raise ValueError(f"Invalid axis {axis} for 2D axial attention")
+
+        q = self.q_proj(x_perm).view(batch_stride, seq_len, self.heads, self.head_dim).permute(0, 2, 1, 3) # [batch_stride, heads, seq_len, head_dim]
+        k = self.k_proj(x_perm).view(batch_stride, seq_len, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x_perm).view(batch_stride, seq_len, self.heads, self.head_dim).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5) # [batch_stride, heads, seq_len, seq_len]
+        attn_weights = F.softmax(scores, dim=-1)
+
+        context = torch.matmul(attn_weights, v) # [batch_stride, heads, seq_len, head_dim]
+        context = context.permute(0, 2, 1, 3).contiguous().view(batch_stride, seq_len, C)
+        out = self.out_proj(context)
+
+        if axis == 1:
+            out = out.view(B, W, H, C).permute(0, 2, 1, 3).contiguous() # [B, H, W, C]
+        else:
+            out = out.view(B, H, W, C).contiguous() # [B, H, W, C]
+
+        assert out.shape == (B, H, W, C), f"Axial Attention Shape Mismatch: {list(out.shape)}"
+        return out
+
+
+class AxialFactorizedAttention2D(nn.Module):
+    """
+    FactFormer Axial Factorized Attention 2D Layer:
+    Executes parallel or cascaded 1D attentions along orthogonal spatial dimensions (H and W)
+    and merges them with channel-wise projection.
+    """
+    def __init__(self, embed_dim, heads=4):
+        super().__init__()
+        self.attn_h = AxialMultiHeadAttention(embed_dim, heads=heads)
+        self.attn_w = AxialMultiHeadAttention(embed_dim, heads=heads)
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+
+        # Compute parallel axial factorized attentions along Height and Width axes
+        out_h = self.attn_h(x, axis=1) # [B, H, W, C]
+        out_w = self.attn_w(x, axis=2) # [B, H, W, C]
+
+        # Concatenate factorized spatial features along channel axis and project
+        fused = torch.cat([out_h, out_w], dim=-1) # [B, H, W, 2*C]
+        out = self.norm(x + self.fuse_proj(fused)) # [B, H, W, C]
+
+        assert out.shape == (B, H, W, C), f"FactFormer 2D Attention Shape Error: {list(out.shape)}"
+        return out
+
+
+class FactFormerBlock(nn.Module):
+    """
+    FactFormer Transformer Block: Axial factorized attention coupled with
+    a pointwise feed-forward network and residual layer normalization.
+    """
+    def __init__(self, embed_dim, heads=4):
+        super().__init__()
+        self.axial_attn = AxialFactorizedAttention2D(embed_dim, heads=heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        attn_out = self.axial_attn(x)
+        ffn_out = self.ffn(attn_out)
+        out = self.norm(attn_out + ffn_out)
+
+        assert out.shape == (B, H, W, C), f"FactFormer Block Shape Error: {list(out.shape)}"
+        return out
+
+
+class FactFormerNet(nn.Module):
+    """
+    Factorized Transformer (FactFormer) Operator Network:
+    Decomposes multi-dimensional grid token matrices into factorized 1D axial attention paths
+    to achieve low-rank high-efficiency PDE modeling.
+    """
+    def __init__(self, node_in_channels=1, hidden_channels=64, out_channels=1, num_layers=3, heads=4):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.heads = heads
+
+        self.lifting = nn.Linear(node_in_channels, hidden_channels)
+
+        self.layers = nn.ModuleList([
+            FactFormerBlock(embed_dim=hidden_channels, heads=heads)
+            for _ in range(num_layers)
+        ])
+
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, out_channels)
+        )
+
+    def forward(self, inputs):
+        assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, \
+            "FactFormerNet Pipeline Error: Expected baseline model parameters wrapped as (x_branch, x_trunk)"
+
+        x_branch, x_trunk = inputs
+
+        if isinstance(x_branch, np.ndarray): x_branch = torch.from_numpy(x_branch).float()
+        if isinstance(x_trunk, np.ndarray): x_trunk = torch.from_numpy(x_trunk).float()
+
+        device = next(self.parameters()).device
+        x_branch = x_branch.to(device)
+        x_trunk = x_trunk.to(device)
+
+        B = x_branch.shape[0]
+        N_nodes = x_trunk.shape[0]
+
+        # Deduce 2D spatial grid resolution from flattened sequence node length
+        H = int(np.round(np.sqrt(N_nodes)))
+        W = H
+
+        # Sanity Check 1: Verify square tensor grid resolution reconstruction
+        assert H * W == N_nodes, f"FactFormer Resolution Error: N_nodes={N_nodes} is not a perfect square grid ({H}x{W})"
+
+        # 1. Lift scalar physical fields into embedded token representation spaces
+        h = self.lifting(x_branch.unsqueeze(-1)) # [B, N_nodes, hidden_channels]
+
+        # Sanity Check 2: Confirm embedded tensor channel structure
+        assert h.shape == (B, N_nodes, self.hidden_channels), f"Lifting Stage Error: Got shape {list(h.shape)}"
+
+        # Reshape 1D node token sequence into 2D grid matrix layout: [B, N_nodes, C] -> [B, H, W, C]
+        h_grid = h.view(B, H, W, self.hidden_channels)
+
+        # 2. Process features through cascaded 2D axial factorized attention blocks
+        for layer in self.layers:
+            h_grid = layer(h_grid)
+
+        # Sanity Check 3: Spatial grid resolution integrity check
+        assert h_grid.shape == (B, H, W, self.hidden_channels), f"FactFormer Layer Processing Error: {list(h_grid.shape)}"
+
+        # Flatten spatial grid matrix back to sequence layout: [B, H, W, C] -> [B, N_nodes, C]
+        h_flat = h_grid.view(B, N_nodes, self.hidden_channels)
+
+        # 3. Project hidden tokens back to scalar physical output values
+        out = self.projection(h_flat).squeeze(-1) # [B, N_nodes]
+
+        # Final Verification Check: Confirm batch dimension alignment matches target output
+        assert out.shape == (B, N_nodes), f"FactFormer Final Output Error: Shape mismatch {list(out.shape)}"
+        return out
+
+print("FactFormer architectural framework successfully initialized. Axial factorized attention pipeline active.")
+
+criterion = nn.MSELoss()
+factformer_model_store = {}
+factformer_histories = {}
+factformer_results = []
+
+# Move coordinates grid to target hardware accelerator
+grid_tensor = torch.tensor(grid, dtype=torch.float32).to(device)
+
+# Sanity Check 1: Verify grid coordinate device type matches hardware setup
+assert grid_tensor.device.type == device.type, \
+    f"Hardware Sync Error: grid_tensor on {grid_tensor.device}, expected {device}"
+assert grid_tensor.shape == (WORKING_RESOLUTION**2, 2), \
+    f"Grid Dimension Error: Got {list(grid_tensor.shape)}"
+
+for epochs in CONFIG["epochs_list"]:
+    for lr in CONFIG["learning_rates"]:
+        print("=" * 70)
+        print(f"Training FactFormer Engine | Target Epochs={epochs} | Learning Rate={lr}")
+        print("=" * 70)
+
+        # Initialize FactFormer network architecture
+        net = FactFormerNet(
+            node_in_channels=1,
+            hidden_channels=64,
+            out_channels=1,
+            num_layers=3,
+            heads=4
+        ).to(device)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+        # Performance tracking registries
+        steps_hist = []
+        train_loss_hist = []
+        test_loss_hist = []
+        test_metric_hist = []
+
+        start_train = time.time()
+
+        for epoch in range(1, epochs + 1):
+            net.train()
+            total_train_loss = 0.0
+
+            for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                # Sanity Check 2: Dynamic batch feature entry dimension validation
+                current_batch_size = batch_x.size(0)
+                assert batch_x.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Input Mismatch: Got {list(batch_x.shape)}"
+                assert batch_y.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Target Mismatch: Got {list(batch_y.shape)}"
+
+                optimizer.zero_grad()
+
+                # Execute factorized axial attention forward pass
+                pred = net((batch_x, grid_tensor))
+
+                # Sanity Check 3: Output tensor dimension synchronization check
+                assert pred.shape == batch_y.shape, \
+                    f"Loss Engine Dimension Collision: Pred {list(pred.shape)} != Target {list(batch_y.shape)}"
+
+                loss = criterion(pred, batch_y)
+                loss.backward()
+                optimizer.step()
+
+                total_train_loss += loss.item() * current_batch_size
+
+            avg_train_loss = total_train_loss / len(train_loader.dataset)
+
+            # Validation / Testing Evaluation Sequence
+            net.eval()
+            total_test_loss = 0.0
+            total_test_l2 = 0.0
+
+            with torch.no_grad():
+                for batch_x, batch_y in test_loader:
+                    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                    pred = net((batch_x, grid_tensor))
+
+                    loss = criterion(pred, batch_y)
+                    total_test_loss += loss.item() * batch_x.size(0)
+
+                    # Compute Relative L2 normalization mismatch
+                    l2_err = torch.norm(pred - batch_y) / torch.norm(batch_y)
+                    total_test_l2 += l2_err.item() * batch_x.size(0)
+
+            avg_test_loss = total_test_loss / len(test_loader.dataset)
+            avg_test_l2 = total_test_l2 / len(test_loader.dataset)
+
+            steps_hist.append(epoch)
+            train_loss_hist.append(avg_train_loss)
+            test_loss_hist.append(avg_test_loss)
+            test_metric_hist.append(avg_test_l2)
+
+            if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
+                print(f"Epoch {epoch:03d}/{epochs:03d} | Train MSE: {avg_train_loss:.6f} | Test MSE: {avg_test_loss:.6f} | Relative L2: {avg_test_l2:.6f}")
+
+        training_time = time.time() - start_train
+
+        # Final Batch Inference Latency Benchmark
+        start_test = time.time()
+        net.eval()
+        with torch.no_grad():
+            branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+            prediction = net((branch_test_tensor, grid_tensor)).cpu().numpy()
+        inference_time = time.time() - start_test
+
+        # Sanity Check 4: Validate full out-of-sample prediction block structure
+        assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+            f"Inference Mapping Shape Mismatch: Got {list(prediction.shape)}"
+
+        prediction_torch = torch.tensor(prediction, dtype=torch.float32)
+        target_torch = torch.tensor(target_test, dtype=torch.float32)
+
+        final_mse = criterion(prediction_torch, target_torch).item()
+        final_l2 = (torch.norm(prediction_torch - target_torch) / torch.norm(target_torch)).item()
+
+        # Update core global state tracking dictionaries with pure FactFormer namespaces
+        key = f"E{epochs}_LR{lr}"
+        factformer_model_store[key] = net
+        factformer_histories[key] = {
+            "epochs": epochs,
+            "learning_rate": lr,
+            "steps": np.array(steps_hist),
+            "train_loss": np.array(train_loss_hist),
+            "test_loss": np.array(test_loss_hist),
+            "test_metric": np.array(test_metric_hist)
+        }
+
+        factformer_results.append({
+            "experiment": key,
+            "epochs": epochs,
+            "learning_rate": lr,
+            "training_time": training_time,
+            "inference_time": inference_time,
+            "train_error": train_loss_hist[-1],
+            "test_error": test_loss_hist[-1],
+            "test_mse": final_mse,
+            "test_l2": final_l2
+        })
+
+print("\nFactFormer Hyperparameter execution sweep completed successfully.")
+factformer_results_df = pd.DataFrame(factformer_results)
+display(factformer_results_df)
+
+# Verify dataframe populate states prior to extraction
+assert not factformer_results_df.empty, "Plotting Error: factformer_results_df dataframe is empty, sweep execution failed"
+assert len(factformer_model_store) > 0, "Plotting Error: factformer_model_store possesses zero compiled model instances"
+
+# Retrieve best model configuration using minimum relative test L2 error index
+best_idx = factformer_results_df["test_l2"].idxmin()
+best_experiment = factformer_results_df.loc[best_idx, "experiment"]
+best_model = factformer_model_store[best_experiment]
+best_history = factformer_histories[best_experiment]
+
+# Sanity Check 1: Explicitly verify structural integrity of retrieved optimal model historical records
+assert "steps" in best_history and "train_loss" in best_history, "Plotting Error: History trace tracking variables corrupted"
+print("Optimal Hyperparameter Profile Designated:", best_experiment)
+
+epochs_axis = best_history["steps"]
+train_total_loss = best_history["train_loss"]
+test_total_loss = best_history["test_loss"]
+test_l2_history = best_history["test_metric"]
+
+# Set up canvas layout matching user layout parameters exactly
+fig, axes = plt.subplots(4, 3, figsize=(24, 22))
+
+# ==========================================================
+# 1 Training Loss
+# ==========================================================
+for key, hist in factformer_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+# ==========================================================
+# 2 Test Loss
+# ==========================================================
+for key, hist in factformer_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+# ==========================================================
+# 3 Relative L2
+# ==========================================================
+for key, hist in factformer_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+# ==========================================================
+# 4 Training Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+# ==========================================================
+# 5 Inference Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+# ==========================================================
+# 6 Train Error
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+# ==========================================================
+# 7 Test Error
+# ==========================================================
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# ==========================================================
+# Best Field Map Prediction Calculations
+# ==========================================================
+best_model.eval()
+with torch.no_grad():
+    branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+    prediction = best_model((branch_test_tensor, grid_tensor)).cpu().numpy()
+
+# Sanity Check 2: Confirm prediction maps match exact batch bounds
+assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+    f"Evaluation Error: Output field predictions shape matrix mismatch: {list(prediction.shape)}"
+
+sample = 0
+true = target_test[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+pred = prediction[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+error = np.abs(pred - true)
+
+# Sanity Check 3: Spatial alignment confirmation prior to imshow allocation
+assert true.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Ground truth matrix failed grid reshape"
+assert pred.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Prediction matrix failed grid reshape"
+assert error.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Spatial error matrix failed grid reshape"
+
+# ==========================================================
+# 8 Ground Truth
+# ==========================================================
+im = axes[2,1].imshow(true, origin="lower")
+axes[2,1].set_title("Ground Truth")
+plt.colorbar(im, ax=axes[2,1])
+
+# ==========================================================
+# 9 Prediction
+# ==========================================================
+im = axes[2,2].imshow(pred, origin="lower")
+axes[2,2].set_title("FactFormer Prediction")
+plt.colorbar(im, ax=axes[2,2])
+
+# ==========================================================
+# 10 Error
+# ==========================================================
+im = axes[3,0].imshow(error, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# ==========================================================
+# 11 Scatter
+# ==========================================================
+axes[3,1].scatter(true.flatten(), pred.flatten(), s=8)
+mn = min(true.min(), pred.min())
+mx = max(true.max(), pred.max())
+axes[3,1].plot([mn,mx], [mn,mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# ==========================================================
+# 12 Histogram
+# ==========================================================
+axes[3,2].hist(error.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save performance diagnostics plot resource under target network framework
+plt.savefig("FactFormer_All_Plots.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+print("Saved Performance Graphics Vector -> FactFormer_All_Plots.png")
+
+# ==========================================================
+# 1. Parameter Initialization & Grid Construction
+# ==========================================================
+NEW_RESOLUTION = 16
+grid_16 = create_grid(NEW_RESOLUTION).numpy().astype(np.float32)
+
+# Sanity Check 1: Verify the geometric coordinate grid configuration for resolution 16
+expected_grid_16_shape = (NEW_RESOLUTION**2, 2)  # (256, 2)
+assert grid_16.shape == expected_grid_16_shape, \
+    f"Grid 16 Shape Error: Got {list(grid_16.shape)}, expected {list(expected_grid_16_shape)}"
+
+# ==========================================================
+# 2. Field Resolution Mapping & Normalization Tracking
+# ==========================================================
+# Map raw high-resolution 64x64 tensors down to target 16x16 testing fields
+x_test_16, y_test_16 = downsample_fields(x_test, y_test, NEW_RESOLUTION)
+
+# Sanity Check 2: Confirm spatial field dimension conversions match targeted resolution
+assert x_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"x_test spatial mapping failure: {x_test_16.shape[2:]}"
+assert y_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"y_test spatial mapping failure: {y_test_16.shape[2:]}"
+
+# Normalize the 16x16 test data using the baseline 8x8 distribution parameters
+x_test_16_norm = (x_test_16 - x_mean) / x_std
+y_test_16_norm = (y_test_16 - y_mean) / y_std
+
+# Filter down to extract the exact same sample sequence tracking group
+x_test_16_sliced = x_test_16_norm[:CONFIG["test_samples"]]
+y_test_16_sliced = y_test_16_norm[:CONFIG["test_samples"]]
+
+# Sanity Check 3: Verify consistency in batch sequence length
+assert len(x_test_16_sliced) == CONFIG["test_samples"], f"Sample mismatch: Got {len(x_test_16_sliced)}"
+
+# Flatten two-dimensional spatial coordinate matrices to 1D field vectors
+branch_test_16 = x_test_16_sliced.reshape(len(x_test_16_sliced), -1).numpy().astype(np.float32)
+target_test_16 = y_test_16_sliced.reshape(len(y_test_16_sliced), -1).numpy().astype(np.float32)
+
+# Sanity Check 4: Matrix shape verification before forward pass execution
+assert branch_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Branch matrix shape error: {branch_test_16.shape}"
+assert target_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Target matrix shape error: {target_test_16.shape}"
+
+# ==========================================================
+# 3. Model Zero-Shot Forward Pass Inference Pipeline
+# ==========================================================
+best_model.eval()
+grid_tensor_16 = torch.tensor(grid_16, dtype=torch.float32).to(device)
+
+# Device sync safety check
+assert grid_tensor_16.device.type == device.type, "Device Mismatch for 16x16 grid tensor"
+
+start_inference_16 = time.time()
+with torch.no_grad():
+    branch_test_tensor_16 = torch.tensor(branch_test_16, dtype=torch.float32).to(device)
+    prediction_16 = best_model((branch_test_tensor_16, grid_tensor_16)).cpu().numpy()
+inference_time_16 = time.time() - start_inference_16
+
+# Sanity Check 5: Confirm model prediction output dimension alignment
+assert prediction_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), \
+    f"Model Output Shape Error: Got {list(prediction_16.shape)}, expected [{CONFIG['test_samples']}, {NEW_RESOLUTION**2}]"
+
+# Compute global evaluation error metrics across the 16x16 mesh grid
+prediction_torch_16 = torch.tensor(prediction_16, dtype=torch.float32)
+target_torch_16 = torch.tensor(target_test_16, dtype=torch.float32)
+
+mse_16 = criterion(prediction_torch_16, target_torch_16).item()
+l2_16 = (torch.norm(prediction_torch_16 - target_torch_16) / torch.norm(target_torch_16)).item()
+
+print(f"\n--- FactFormer Zero-Shot Resolution Evaluation Analysis ({NEW_RESOLUTION}x{NEW_RESOLUTION}) ---")
+print(f"Optimal Model Variant Employed : {best_experiment}")
+print(f"Computed Mesh Mean Squared Error (MSE)   : {mse_16:.6f}")
+print(f"Computed Mesh Relative L2 Error Score   : {l2_16:.6f}")
+print(f"Total Batch Forward Inference Latency  : {inference_time_16:.4f} seconds")
+
+# ==========================================================
+# 4. Diagnostics & Comparative Visual Plotting Engine
+# ==========================================================
+sample = 0
+true_16 = target_test_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+pred_16 = prediction_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+error_16 = np.abs(pred_16 - true_16)
+
+# Sanity Check 6: Check spatial dimensions match before grid rendering
+assert true_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "True field failed grid conversion"
+assert pred_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Predicted field failed grid conversion"
+assert error_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Spatial error field failed grid conversion"
+
+fig, axes = plt.subplots(
+    4,
+    3,
+    figsize=(24, 22)
+)
+
+# [Subplots 1 to 7]: Re-plot original historical training sweep metrics
+for key, hist in factformer_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+for key, hist in factformer_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+for key, hist in factformer_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = factformer_results_df[factformer_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# [Subplots 8 to 12]: Plot zero-shot model inference fields evaluated at 16x16 resolution
+# 8 Ground Truth Map
+im = axes[2,1].imshow(true_16, origin="lower")
+axes[2,1].set_title(f"Ground Truth ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,1])
+
+# 9 Model Prediction Field Map
+im = axes[2,2].imshow(pred_16, origin="lower")
+axes[2,2].set_title(f"FactFormer Prediction ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,2])
+
+# 10 Absolute Localized Grid Error Map
+im = axes[3,0].imshow(error_16, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# 11 Regression Scatter Comparison Matrix
+axes[3,1].scatter(true_16.flatten(), pred_16.flatten(), s=8)
+mn = min(true_16.min(), pred_16.min())
+mx = max(true_16.max(), pred_16.max())
+axes[3,1].plot([mn, mx], [mn, mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# 12 Discrepancy Density Histogram Distribution
+axes[3,2].hist(error_16.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save image profile tracking resource asset to disk
+plt.savefig(
+    "FactFormer_Resolution_16_Plots.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+print("Saved Performance Graphics Vector -> FactFormer_Resolution_16_Plots.png")
+
+class PhysicsSliceAttention(nn.Module):
+    """
+    Transolver Physics-Attention Module:
+    1. Projects spatial mesh tokens into K learnable physical slices (subdomains).
+    2. Performs multi-head self-attention strictly across the K slices O(K^2).
+    3. Maps transformed slice representations back to the N spatial mesh points O(N*K).
+    Achieves linear O(N) memory complexity with zero reliance on regular tensor grids.
+    """
+    def __init__(self, embed_dim, num_slices=8, heads=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_slices = num_slices
+        self.heads = heads
+        self.head_dim = embed_dim // heads
+
+        assert self.head_dim * heads == embed_dim, "Transolver Error: embed_dim must be cleanly divisible by heads count"
+
+        # Physical Slice Assignment Network: Maps N mesh points to K soft slice weights
+        self.slice_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, num_slices)
+        )
+
+        # Inter-slice multi-head attention components
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        K = self.num_slices
+        H = self.heads
+        D = self.head_dim
+
+        # 1. Compute soft physical slice assignments S: [B, N, K]
+        # Softmax over spatial dimension N normalizes point contributions across each slice
+        slice_logits = self.slice_proj(x) # [B, N, K]
+        S = F.softmax(slice_logits, dim=-2)
+
+        # Sanity Check 1: Verify slice assignment matrix structure
+        assert S.shape == (B, N, K), f"Slice Assignment Error: Got shape {list(S.shape)}"
+
+        # 2. Slice Aggregation: Compress N spatial tokens into K global physical slice states Z
+        # S is [B, N, K], x is [B, N, C] -> Z = S^T @ x -> [B, K, C]
+        Z = torch.bmm(S.transpose(1, 2), x) # [B, K, C]
+
+        # Sanity Check 2: Confirm physical slice feature matrix aggregation
+        assert Z.shape == (B, K, C), f"Slice Aggregation Error: Got shape {list(Z.shape)}"
+
+        # 3. Inter-Slice Multi-Head Self-Attention: O(K^2) computational cost
+        q = self.q_proj(Z).view(B, K, H, D).permute(0, 2, 1, 3) # [B, H, K, D]
+        k = self.k_proj(Z).view(B, K, H, D).permute(0, 2, 1, 3) # [B, H, K, D]
+        v = self.v_proj(Z).view(B, K, H, D).permute(0, 2, 1, 3) # [B, H, K, D]
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (D ** 0.5) # [B, H, K, K]
+        attn_weights = F.softmax(scores, dim=-1)
+
+        context = torch.matmul(attn_weights, v) # [B, H, K, D]
+        context = context.permute(0, 2, 1, 3).contiguous().view(B, K, C) # [B, K, C]
+        Z_attn = self.out_proj(context)
+
+        # 4. De-slicing Projection: Broadcast slice features back to original N mesh nodes
+        # S is [B, N, K], Z_attn is [B, K, C] -> x_out = S @ Z_attn -> [B, N, C]
+        x_out = torch.bmm(S, Z_attn) # [B, N, C]
+
+        # Sanity Check 3: Check spatial token reconstruction alignment
+        assert x_out.shape == (B, N, C), f"De-slicing Error: Got shape {list(x_out.shape)}"
+
+        out = self.norm(x + x_out)
+        return out
+
+
+class TransolverBlock(nn.Module):
+    """
+    Transolver Transformer Block: Combines Physics Slice-Attention with
+    a point-wise Feed-Forward Network and residual normalization.
+    """
+    def __init__(self, embed_dim, num_slices=8, heads=4):
+        super().__init__()
+        self.slice_attn = PhysicsSliceAttention(embed_dim, num_slices=num_slices, heads=heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        attn_out = self.slice_attn(x)
+        ffn_out = self.ffn(attn_out)
+        out = self.norm(attn_out + ffn_out)
+        return out
+
+
+class TransolverNet(nn.Module):
+    """
+    Transolver Neural Operator Network:
+    Uses learnable physical slices to decouple self-attention from mesh resolution,
+    enabling efficient linear-time evaluation across structured or unstructured geometries.
+    """
+    def __init__(self, node_in_channels=1, hidden_channels=64, out_channels=1, num_layers=3, num_slices=8, heads=4):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+
+        self.lifting = nn.Linear(node_in_channels, hidden_channels)
+
+        self.layers = nn.ModuleList([
+            TransolverBlock(embed_dim=hidden_channels, num_slices=num_slices, heads=heads)
+            for _ in range(num_layers)
+        ])
+
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, out_channels)
+        )
+
+    def forward(self, inputs):
+        assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, \
+            "TransolverNet Error: Inputs must be formatted as (x_branch, x_trunk)"
+
+        x_branch, x_trunk = inputs
+
+        if isinstance(x_branch, np.ndarray): x_branch = torch.from_numpy(x_branch).float()
+        if isinstance(x_trunk, np.ndarray): x_trunk = torch.from_numpy(x_trunk).float()
+
+        device = next(self.parameters()).device
+        x_branch = x_branch.to(device)
+        x_trunk = x_trunk.to(device)
+
+        B = x_branch.shape[0]
+        N_nodes = x_trunk.shape[0]
+
+        # 1. Map node scalar fields to hidden channel embeddings
+        h = self.lifting(x_branch.unsqueeze(-1)) # [B, N_nodes, hidden_channels]
+
+        # Sanity Check 1: Verify lifting feature dimensions
+        assert h.shape == (B, N_nodes, self.hidden_channels), f"Lifting Error: Got shape {list(h.shape)}"
+
+        # 2. Pass sequence through Transolver Physics Slice-Attention layers
+        for layer in self.layers:
+            h = layer(h)
+
+        # Sanity Check 2: Verify feature shape stability across deep layers
+        assert h.shape == (B, N_nodes, self.hidden_channels), f"Transolver Layer Processing Error: {list(h.shape)}"
+
+        # 3. Project hidden representations to predicted PDE scalar field
+        out = self.projection(h).squeeze(-1) # [B, N_nodes]
+
+        # Final Sanity Check: Confirm batch dimension alignment matches target output
+        assert out.shape == (B, N_nodes), f"Transolver Final Output Error: Shape mismatch {list(out.shape)}"
+        return out
+
+print("Transolver architectural framework successfully initialized. Physics Slice-Attention active.")
+
+criterion = nn.MSELoss()
+transolver_model_store = {}
+transolver_histories = {}
+transolver_results = []
+
+# Move coordinates grid to target hardware accelerator
+grid_tensor = torch.tensor(grid, dtype=torch.float32).to(device)
+
+# Sanity Check 1: Verify grid coordinate device type matches hardware setup
+assert grid_tensor.device.type == device.type, \
+    f"Hardware Sync Error: grid_tensor on {grid_tensor.device}, expected {device}"
+assert grid_tensor.shape == (WORKING_RESOLUTION**2, 2), \
+    f"Grid Dimension Error: Got {list(grid_tensor.shape)}"
+
+for epochs in CONFIG["epochs_list"]:
+    for lr in CONFIG["learning_rates"]:
+        print("=" * 70)
+        print(f"Training Transolver Engine | Target Epochs={epochs} | Learning Rate={lr}")
+        print("=" * 70)
+
+        # Initialize Transolver network architecture
+        net = TransolverNet(
+            node_in_channels=1,
+            hidden_channels=64,
+            out_channels=1,
+            num_layers=3,
+            num_slices=8,
+            heads=4
+        ).to(device)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+        # Performance tracking registries
+        steps_hist = []
+        train_loss_hist = []
+        test_loss_hist = []
+        test_metric_hist = []
+
+        start_train = time.time()
+
+        for epoch in range(1, epochs + 1):
+            net.train()
+            total_train_loss = 0.0
+
+            for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                # Sanity Check 2: Dynamic batch feature entry dimension validation
+                current_batch_size = batch_x.size(0)
+                assert batch_x.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Input Mismatch: Got {list(batch_x.shape)}"
+                assert batch_y.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Target Mismatch: Got {list(batch_y.shape)}"
+
+                optimizer.zero_grad()
+
+                # Execute Physics Slice-Attention forward pass
+                pred = net((batch_x, grid_tensor))
+
+                # Sanity Check 3: Output tensor dimension synchronization check
+                assert pred.shape == batch_y.shape, \
+                    f"Loss Engine Dimension Collision: Pred {list(pred.shape)} != Target {list(batch_y.shape)}"
+
+                loss = criterion(pred, batch_y)
+                loss.backward()
+                optimizer.step()
+
+                total_train_loss += loss.item() * current_batch_size
+
+            avg_train_loss = total_train_loss / len(train_loader.dataset)
+
+            # Validation / Testing Evaluation Sequence
+            net.eval()
+            total_test_loss = 0.0
+            total_test_l2 = 0.0
+
+            with torch.no_grad():
+                for batch_x, batch_y in test_loader:
+                    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                    pred = net((batch_x, grid_tensor))
+
+                    loss = criterion(pred, batch_y)
+                    total_test_loss += loss.item() * batch_x.size(0)
+
+                    # Compute Relative L2 normalization mismatch
+                    l2_err = torch.norm(pred - batch_y) / torch.norm(batch_y)
+                    total_test_l2 += l2_err.item() * batch_x.size(0)
+
+            avg_test_loss = total_test_loss / len(test_loader.dataset)
+            avg_test_l2 = total_test_l2 / len(test_loader.dataset)
+
+            steps_hist.append(epoch)
+            train_loss_hist.append(avg_train_loss)
+            test_loss_hist.append(avg_test_loss)
+            test_metric_hist.append(avg_test_l2)
+
+            if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
+                print(f"Epoch {epoch:03d}/{epochs:03d} | Train MSE: {avg_train_loss:.6f} | Test MSE: {avg_test_loss:.6f} | Relative L2: {avg_test_l2:.6f}")
+
+        training_time = time.time() - start_train
+
+        # Final Batch Inference Latency Benchmark
+        start_test = time.time()
+        net.eval()
+        with torch.no_grad():
+            branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+            prediction = net((branch_test_tensor, grid_tensor)).cpu().numpy()
+        inference_time = time.time() - start_test
+
+        # Sanity Check 4: Validate full out-of-sample prediction block structure
+        assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+            f"Inference Mapping Shape Mismatch: Got {list(prediction.shape)}"
+
+        prediction_torch = torch.tensor(prediction, dtype=torch.float32)
+        target_torch = torch.tensor(target_test, dtype=torch.float32)
+
+        final_mse = criterion(prediction_torch, target_torch).item()
+        final_l2 = (torch.norm(prediction_torch - target_torch) / torch.norm(target_torch)).item()
+
+        # Update core global state tracking dictionaries with pure Transolver namespaces
+        key = f"E{epochs}_LR{lr}"
+        transolver_model_store[key] = net
+        transolver_histories[key] = {
+            "epochs": epochs,
+            "learning_rate": lr,
+            "steps": np.array(steps_hist),
+            "train_loss": np.array(train_loss_hist),
+            "test_loss": np.array(test_loss_hist),
+            "test_metric": np.array(test_metric_hist)
+        }
+
+        transolver_results.append({
+            "experiment": key,
+            "epochs": epochs,
+            "learning_rate": lr,
+            "training_time": training_time,
+            "inference_time": inference_time,
+            "train_error": train_loss_hist[-1],
+            "test_error": test_loss_hist[-1],
+            "test_mse": final_mse,
+            "test_l2": final_l2
+        })
+
+print("\nTransolver Hyperparameter execution sweep completed successfully.")
+transolver_results_df = pd.DataFrame(transolver_results)
+display(transolver_results_df)
+
+# Verify dataframe populate states prior to extraction
+assert not transolver_results_df.empty, "Plotting Error: transolver_results_df dataframe is empty, sweep execution failed"
+assert len(transolver_model_store) > 0, "Plotting Error: transolver_model_store possesses zero compiled model instances"
+
+# Retrieve best model configuration using minimum relative test L2 error index
+best_idx = transolver_results_df["test_l2"].idxmin()
+best_experiment = transolver_results_df.loc[best_idx, "experiment"]
+best_model = transolver_model_store[best_experiment]
+best_history = transolver_histories[best_experiment]
+
+# Sanity Check 1: Explicitly verify structural integrity of retrieved optimal model historical records
+assert "steps" in best_history and "train_loss" in best_history, "Plotting Error: History trace tracking variables corrupted"
+print("Optimal Hyperparameter Profile Designated:", best_experiment)
+
+epochs_axis = best_history["steps"]
+train_total_loss = best_history["train_loss"]
+test_total_loss = best_history["test_loss"]
+test_l2_history = best_history["test_metric"]
+
+# Set up canvas layout matching user layout parameters exactly
+fig, axes = plt.subplots(4, 3, figsize=(24, 22))
+
+# ==========================================================
+# 1 Training Loss
+# ==========================================================
+for key, hist in transolver_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+# ==========================================================
+# 2 Test Loss
+# ==========================================================
+for key, hist in transolver_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+# ==========================================================
+# 3 Relative L2
+# ==========================================================
+for key, hist in transolver_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+# ==========================================================
+# 4 Training Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+# ==========================================================
+# 5 Inference Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+# ==========================================================
+# 6 Train Error
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+# ==========================================================
+# 7 Test Error
+# ==========================================================
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# ==========================================================
+# Best Field Map Prediction Calculations
+# ==========================================================
+best_model.eval()
+with torch.no_grad():
+    branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+    prediction = best_model((branch_test_tensor, grid_tensor)).cpu().numpy()
+
+# Sanity Check 2: Confirm prediction maps match exact batch bounds
+assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+    f"Evaluation Error: Output field predictions shape matrix mismatch: {list(prediction.shape)}"
+
+sample = 0
+true = target_test[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+pred = prediction[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+error = np.abs(pred - true)
+
+# Sanity Check 3: Spatial alignment confirmation prior to imshow allocation
+assert true.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Ground truth matrix failed grid reshape"
+assert pred.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Prediction matrix failed grid reshape"
+assert error.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Spatial error matrix failed grid reshape"
+
+# ==========================================================
+# 8 Ground Truth
+# ==========================================================
+im = axes[2,1].imshow(true, origin="lower")
+axes[2,1].set_title("Ground Truth")
+plt.colorbar(im, ax=axes[2,1])
+
+# ==========================================================
+# 9 Prediction
+# ==========================================================
+im = axes[2,2].imshow(pred, origin="lower")
+axes[2,2].set_title("Transolver Prediction")
+plt.colorbar(im, ax=axes[2,2])
+
+# ==========================================================
+# 10 Error
+# ==========================================================
+im = axes[3,0].imshow(error, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# ==========================================================
+# 11 Scatter
+# ==========================================================
+axes[3,1].scatter(true.flatten(), pred.flatten(), s=8)
+mn = min(true.min(), pred.min())
+mx = max(true.max(), pred.max())
+axes[3,1].plot([mn,mx], [mn,mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# ==========================================================
+# 12 Histogram
+# ==========================================================
+axes[3,2].hist(error.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save performance diagnostics plot resource under target network framework
+plt.savefig("Transolver_All_Plots.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+print("Saved Performance Graphics Vector -> Transolver_All_Plots.png")
+
+# ==========================================================
+# 1. Parameter Initialization & Grid Construction
+# ==========================================================
+NEW_RESOLUTION = 16
+grid_16 = create_grid(NEW_RESOLUTION).numpy().astype(np.float32)
+
+# Sanity Check 1: Verify the geometric coordinate grid configuration for resolution 16
+expected_grid_16_shape = (NEW_RESOLUTION**2, 2)  # (256, 2)
+assert grid_16.shape == expected_grid_16_shape, \
+    f"Grid 16 Shape Error: Got {list(grid_16.shape)}, expected {list(expected_grid_16_shape)}"
+
+# ==========================================================
+# 2. Field Resolution Mapping & Normalization Tracking
+# ==========================================================
+# Map raw high-resolution 64x64 tensors down to target 16x16 testing fields
+x_test_16, y_test_16 = downsample_fields(x_test, y_test, NEW_RESOLUTION)
+
+# Sanity Check 2: Confirm spatial field dimension conversions match targeted resolution
+assert x_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"x_test spatial mapping failure: {x_test_16.shape[2:]}"
+assert y_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"y_test spatial mapping failure: {y_test_16.shape[2:]}"
+
+# Normalize the 16x16 test data using the baseline 8x8 distribution parameters
+x_test_16_norm = (x_test_16 - x_mean) / x_std
+y_test_16_norm = (y_test_16 - y_mean) / y_std
+
+# Filter down to extract the exact same sample sequence tracking group
+x_test_16_sliced = x_test_16_norm[:CONFIG["test_samples"]]
+y_test_16_sliced = y_test_16_norm[:CONFIG["test_samples"]]
+
+# Sanity Check 3: Verify consistency in batch sequence length
+assert len(x_test_16_sliced) == CONFIG["test_samples"], f"Sample mismatch: Got {len(x_test_16_sliced)}"
+
+# Flatten two-dimensional spatial coordinate matrices to 1D field vectors
+branch_test_16 = x_test_16_sliced.reshape(len(x_test_16_sliced), -1).numpy().astype(np.float32)
+target_test_16 = y_test_16_sliced.reshape(len(y_test_16_sliced), -1).numpy().astype(np.float32)
+
+# Sanity Check 4: Matrix shape verification before forward pass execution
+assert branch_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Branch matrix shape error: {branch_test_16.shape}"
+assert target_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Target matrix shape error: {target_test_16.shape}"
+
+# ==========================================================
+# 3. Model Zero-Shot Forward Pass Inference Pipeline
+# ==========================================================
+best_model.eval()
+grid_tensor_16 = torch.tensor(grid_16, dtype=torch.float32).to(device)
+
+# Device sync safety check
+assert grid_tensor_16.device.type == device.type, "Device Mismatch for 16x16 grid tensor"
+
+start_inference_16 = time.time()
+with torch.no_grad():
+    branch_test_tensor_16 = torch.tensor(branch_test_16, dtype=torch.float32).to(device)
+    prediction_16 = best_model((branch_test_tensor_16, grid_tensor_16)).cpu().numpy()
+inference_time_16 = time.time() - start_inference_16
+
+# Sanity Check 5: Confirm model prediction output dimension alignment
+assert prediction_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), \
+    f"Model Output Shape Error: Got {list(prediction_16.shape)}, expected [{CONFIG['test_samples']}, {NEW_RESOLUTION**2}]"
+
+# Compute global evaluation error metrics across the 16x16 mesh grid
+prediction_torch_16 = torch.tensor(prediction_16, dtype=torch.float32)
+target_torch_16 = torch.tensor(target_test_16, dtype=torch.float32)
+
+mse_16 = criterion(prediction_torch_16, target_torch_16).item()
+l2_16 = (torch.norm(prediction_torch_16 - target_torch_16) / torch.norm(target_torch_16)).item()
+
+print(f"\n--- Transolver Zero-Shot Resolution Evaluation Analysis ({NEW_RESOLUTION}x{NEW_RESOLUTION}) ---")
+print(f"Optimal Model Variant Employed : {best_experiment}")
+print(f"Computed Mesh Mean Squared Error (MSE)   : {mse_16:.6f}")
+print(f"Computed Mesh Relative L2 Error Score   : {l2_16:.6f}")
+print(f"Total Batch Forward Inference Latency  : {inference_time_16:.4f} seconds")
+
+# ==========================================================
+# 4. Diagnostics & Comparative Visual Plotting Engine
+# ==========================================================
+sample = 0
+true_16 = target_test_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+pred_16 = prediction_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+error_16 = np.abs(pred_16 - true_16)
+
+# Sanity Check 6: Check spatial dimensions match before grid rendering
+assert true_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "True field failed grid conversion"
+assert pred_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Predicted field failed grid conversion"
+assert error_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Spatial error field failed grid conversion"
+
+fig, axes = plt.subplots(
+    4,
+    3,
+    figsize=(24, 22)
+)
+
+# [Subplots 1 to 7]: Re-plot original historical training sweep metrics
+for key, hist in transolver_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+for key, hist in transolver_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+for key, hist in transolver_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = transolver_results_df[transolver_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# [Subplots 8 to 12]: Plot zero-shot model inference fields evaluated at 16x16 resolution
+# 8 Ground Truth Map
+im = axes[2,1].imshow(true_16, origin="lower")
+axes[2,1].set_title(f"Ground Truth ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,1])
+
+# 9 Model Prediction Field Map
+im = axes[2,2].imshow(pred_16, origin="lower")
+axes[2,2].set_title(f"Transolver Prediction ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,2])
+
+# 10 Absolute Localized Grid Error Map
+im = axes[3,0].imshow(error_16, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# 11 Regression Scatter Comparison Matrix
+axes[3,1].scatter(true_16.flatten(), pred_16.flatten(), s=8)
+mn = min(true_16.min(), pred_16.min())
+mx = max(true_16.max(), pred_16.max())
+axes[3,1].plot([mn, mx], [mn, mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# 12 Discrepancy Density Histogram Distribution
+axes[3,2].hist(error_16.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save image profile tracking resource asset to disk
+plt.savefig(
+    "Transolver_Resolution_16_Plots.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+print("Saved Performance Graphics Vector -> Transolver_Resolution_16_Plots.png")
+
+class KernelizedLinearAttention(nn.Module):
+    """
+    LinearNO Kernelized Attention Module:
+    Replaces standard softmax attention O(N^2) with positive feature map kernels phi(Q) and phi(K).
+
+    By exploiting matrix associativity:
+      (phi(Q) @ phi(K)^T) @ V  ==  phi(Q) @ (phi(K)^T @ V)
+
+    This reduces computational and memory complexity strictly to linear O(N * d^2)
+    without needing spatial grid slicing or factorized tensor dimensions.
+    """
+    def __init__(self, embed_dim, heads=4, eps=1e-6):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.heads = heads
+        self.head_dim = embed_dim // heads
+        self.eps = eps
+
+        assert self.head_dim * heads == embed_dim, "LinearNO Error: embed_dim must be cleanly divisible by heads count"
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def feature_map(self, x):
+        # ELU + 1 guarantees non-negativity required for valid probability measure kernel approximation
+        return F.elu(x) + 1.0
+
+    def forward(self, x):
+        B, N, C = x.shape
+        H = self.heads
+        D = self.head_dim
+
+        # Project Queries, Keys, and Values: [B, N, C] -> [B, H, N, D]
+        q = self.q_proj(x).view(B, N, H, D).permute(0, 2, 1, 3)
+        k = self.k_proj(x).view(B, N, H, D).permute(0, 2, 1, 3)
+        v = self.v_proj(x).view(B, N, H, D).permute(0, 2, 1, 3)
+
+        # Apply non-negative kernel feature mapping
+        q_phi = self.feature_map(q)  # [B, H, N, D]
+        k_phi = self.feature_map(k)  # [B, H, N, D]
+
+        # Sanity Check 1: Non-negativity assertion for stability
+        assert (q_phi >= 0).all(), "LinearNO Error: Negative feature map values detected in queries"
+        assert (k_phi >= 0).all(), "LinearNO Error: Negative feature map values detected in keys"
+
+        # 1. Compute summary context matrix KV = K_phi^T @ V -> [B, H, D, D]
+        # Eliminates the N x N sequence dimension from intermediate tensor storage!
+        kv = torch.matmul(k_phi.transpose(-2, -1), v)  # [B, H, D, D]
+
+        # 2. Compute normalizer sum for exact probability density scaling: [B, H, N, 1]
+        k_sum = k_phi.sum(dim=-2, keepdim=True)        # [B, H, 1, D]
+        denom = torch.matmul(q_phi, k_sum.transpose(-2, -1)) + self.eps  # [B, H, N, 1]
+
+        # 3. Compute numerator and scale: (Q_phi @ KV) / Denominator
+        num = torch.matmul(q_phi, kv)                   # [B, H, N, D]
+        out_attn = num / denom                         # [B, H, N, D]
+
+        # Sanity Check 2: Confirm output dimension sequence alignment
+        assert out_attn.shape == (B, H, N, D), f"Kernel Attention Output Shape Error: {list(out_attn.shape)}"
+
+        # Reshape multi-head representations back to sequence layout
+        context = out_attn.permute(0, 2, 1, 3).contiguous().view(B, N, C)
+        out = self.norm(x + self.out_proj(context))
+        return out
+
+
+class LinearNOBlock(nn.Module):
+    """
+    LinearNO Operator Block: Couples Kernelized Linear Attention with
+    a Feed-Forward Network and residual normalization.
+    """
+    def __init__(self, embed_dim, heads=4):
+        super().__init__()
+        self.attn = KernelizedLinearAttention(embed_dim, heads=heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        attn_out = self.attn(x)
+        ffn_out = self.ffn(attn_out)
+        out = self.norm(attn_out + ffn_out)
+        return out
+
+
+class LinearNONet(nn.Module):
+    """
+    Linear Attention Neural Operator (LinearNO):
+    Achieves pure O(N) linear time and memory scaling using kernel feature mapping.
+    """
+    def __init__(self, node_in_channels=1, hidden_channels=64, out_channels=1, num_layers=3, heads=4):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+
+        self.lifting = nn.Linear(node_in_channels, hidden_channels)
+
+        self.layers = nn.ModuleList([
+            LinearNOBlock(embed_dim=hidden_channels, heads=heads)
+            for _ in range(num_layers)
+        ])
+
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, out_channels)
+        )
+
+    def forward(self, inputs):
+        assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, \
+            "LinearNONet Error: Inputs must be formatted as (x_branch, x_trunk)"
+
+        x_branch, x_trunk = inputs
+
+        if isinstance(x_branch, np.ndarray): x_branch = torch.from_numpy(x_branch).float()
+        if isinstance(x_trunk, np.ndarray): x_trunk = torch.from_numpy(x_trunk).float()
+
+        device = next(self.parameters()).device
+        x_branch = x_branch.to(device)
+        x_trunk = x_trunk.to(device)
+
+        B = x_branch.shape[0]
+        N_nodes = x_trunk.shape[0]
+
+        # 1. Lift scalar physical fields into embedded token space
+        h = self.lifting(x_branch.unsqueeze(-1)) # [B, N_nodes, hidden_channels]
+
+        # Sanity Check 1: Verify lifting feature dimensions
+        assert h.shape == (B, N_nodes, self.hidden_channels), f"Lifting Error: Got shape {list(h.shape)}"
+
+        # 2. Pass sequence through kernelized linear attention layers
+        for layer in self.layers:
+            h = layer(h)
+
+        # Sanity Check 2: Verify feature shape stability across deep layers
+        assert h.shape == (B, N_nodes, self.hidden_channels), f"LinearNO Layer Processing Error: {list(h.shape)}"
+
+        # 3. Project hidden representations to predicted PDE scalar field
+        out = self.projection(h).squeeze(-1) # [B, N_nodes]
+
+        # Final Sanity Check: Confirm batch dimension alignment matches target output
+        assert out.shape == (B, N_nodes), f"LinearNO Final Output Error: Shape mismatch {list(out.shape)}"
+        return out
+
+print("LinearNO architectural framework successfully initialized. Kernelized Linear Attention active.")
+
+criterion = nn.MSELoss()
+linearno_model_store = {}
+linearno_histories = {}
+linearno_results = []
+
+# Move coordinates grid to target hardware accelerator
+grid_tensor = torch.tensor(grid, dtype=torch.float32).to(device)
+
+# Sanity Check 1: Verify grid coordinate device type matches hardware setup
+assert grid_tensor.device.type == device.type, \
+    f"Hardware Sync Error: grid_tensor on {grid_tensor.device}, expected {device}"
+assert grid_tensor.shape == (WORKING_RESOLUTION**2, 2), \
+    f"Grid Dimension Error: Got {list(grid_tensor.shape)}"
+
+for epochs in CONFIG["epochs_list"]:
+    for lr in CONFIG["learning_rates"]:
+        print("=" * 70)
+        print(f"Training LinearNO Engine | Target Epochs={epochs} | Learning Rate={lr}")
+        print("=" * 70)
+
+        # Initialize LinearNO network architecture
+        net = LinearNONet(
+            node_in_channels=1,
+            hidden_channels=64,
+            out_channels=1,
+            num_layers=3,
+            heads=4
+        ).to(device)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+        # Performance tracking registries
+        steps_hist = []
+        train_loss_hist = []
+        test_loss_hist = []
+        test_metric_hist = []
+
+        start_train = time.time()
+
+        for epoch in range(1, epochs + 1):
+            net.train()
+            total_train_loss = 0.0
+
+            for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                # Sanity Check 2: Dynamic batch feature entry dimension validation
+                current_batch_size = batch_x.size(0)
+                assert batch_x.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Input Mismatch: Got {list(batch_x.shape)}"
+                assert batch_y.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Target Mismatch: Got {list(batch_y.shape)}"
+
+                optimizer.zero_grad()
+
+                # Execute kernelized linear attention forward pass
+                pred = net((batch_x, grid_tensor))
+
+                # Sanity Check 3: Output tensor dimension synchronization check
+                assert pred.shape == batch_y.shape, \
+                    f"Loss Engine Dimension Collision: Pred {list(pred.shape)} != Target {list(batch_y.shape)}"
+
+                loss = criterion(pred, batch_y)
+                loss.backward()
+                optimizer.step()
+
+                total_train_loss += loss.item() * current_batch_size
+
+            avg_train_loss = total_train_loss / len(train_loader.dataset)
+
+            # Validation / Testing Evaluation Sequence
+            net.eval()
+            total_test_loss = 0.0
+            total_test_l2 = 0.0
+
+            with torch.no_grad():
+                for batch_x, batch_y in test_loader:
+                    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                    pred = net((batch_x, grid_tensor))
+
+                    loss = criterion(pred, batch_y)
+                    total_test_loss += loss.item() * batch_x.size(0)
+
+                    # Compute Relative L2 normalization mismatch
+                    l2_err = torch.norm(pred - batch_y) / torch.norm(batch_y)
+                    total_test_l2 += l2_err.item() * batch_x.size(0)
+
+            avg_test_loss = total_test_loss / len(test_loader.dataset)
+            avg_test_l2 = total_test_l2 / len(test_loader.dataset)
+
+            steps_hist.append(epoch)
+            train_loss_hist.append(avg_train_loss)
+            test_loss_hist.append(avg_test_loss)
+            test_metric_hist.append(avg_test_l2)
+
+            if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
+                print(f"Epoch {epoch:03d}/{epochs:03d} | Train MSE: {avg_train_loss:.6f} | Test MSE: {avg_test_loss:.6f} | Relative L2: {avg_test_l2:.6f}")
+
+        training_time = time.time() - start_train
+
+        # Final Batch Inference Latency Benchmark
+        start_test = time.time()
+        net.eval()
+        with torch.no_grad():
+            branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+            prediction = net((branch_test_tensor, grid_tensor)).cpu().numpy()
+        inference_time = time.time() - start_test
+
+        # Sanity Check 4: Validate full out-of-sample prediction block structure
+        assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+            f"Inference Mapping Shape Mismatch: Got {list(prediction.shape)}"
+
+        prediction_torch = torch.tensor(prediction, dtype=torch.float32)
+        target_torch = torch.tensor(target_test, dtype=torch.float32)
+
+        final_mse = criterion(prediction_torch, target_torch).item()
+        final_l2 = (torch.norm(prediction_torch - target_torch) / torch.norm(target_torch)).item()
+
+        # Update core global state tracking dictionaries with pure LinearNO namespaces
+        key = f"E{epochs}_LR{lr}"
+        linearno_model_store[key] = net
+        linearno_histories[key] = {
+            "epochs": epochs,
+            "learning_rate": lr,
+            "steps": np.array(steps_hist),
+            "train_loss": np.array(train_loss_hist),
+            "test_loss": np.array(test_loss_hist),
+            "test_metric": np.array(test_metric_hist)
+        }
+
+        linearno_results.append({
+            "experiment": key,
+            "epochs": epochs,
+            "learning_rate": lr,
+            "training_time": training_time,
+            "inference_time": inference_time,
+            "train_error": train_loss_hist[-1],
+            "test_error": test_loss_hist[-1],
+            "test_mse": final_mse,
+            "test_l2": final_l2
+        })
+
+print("\nLinearNO Hyperparameter execution sweep completed successfully.")
+linearno_results_df = pd.DataFrame(linearno_results)
+display(linearno_results_df)
+
+# Verify dataframe populate states prior to extraction
+assert not linearno_results_df.empty, "Plotting Error: linearno_results_df dataframe is empty, sweep execution failed"
+assert len(linearno_model_store) > 0, "Plotting Error: linearno_model_store possesses zero compiled model instances"
+
+# Retrieve best model configuration using minimum relative test L2 error index
+best_idx = linearno_results_df["test_l2"].idxmin()
+best_experiment = linearno_results_df.loc[best_idx, "experiment"]
+best_model = linearno_model_store[best_experiment]
+best_history = linearno_histories[best_experiment]
+
+# Sanity Check 1: Explicitly verify structural integrity of retrieved optimal model historical records
+assert "steps" in best_history and "train_loss" in best_history, "Plotting Error: History trace tracking variables corrupted"
+print("Optimal Hyperparameter Profile Designated:", best_experiment)
+
+epochs_axis = best_history["steps"]
+train_total_loss = best_history["train_loss"]
+test_total_loss = best_history["test_loss"]
+test_l2_history = best_history["test_metric"]
+
+# Set up canvas layout matching user layout parameters exactly
+fig, axes = plt.subplots(4, 3, figsize=(24, 22))
+
+# ==========================================================
+# 1 Training Loss
+# ==========================================================
+for key, hist in linearno_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+# ==========================================================
+# 2 Test Loss
+# ==========================================================
+for key, hist in linearno_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+# ==========================================================
+# 3 Relative L2
+# ==========================================================
+for key, hist in linearno_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+# ==========================================================
+# 4 Training Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+# ==========================================================
+# 5 Inference Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+# ==========================================================
+# 6 Train Error
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+# ==========================================================
+# 7 Test Error
+# ==========================================================
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# ==========================================================
+# Best Field Map Prediction Calculations
+# ==========================================================
+best_model.eval()
+with torch.no_grad():
+    branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+    prediction = best_model((branch_test_tensor, grid_tensor)).cpu().numpy()
+
+# Sanity Check 2: Confirm prediction maps match exact batch bounds
+assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+    f"Evaluation Error: Output field predictions shape matrix mismatch: {list(prediction.shape)}"
+
+sample = 0
+true = target_test[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+pred = prediction[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+error = np.abs(pred - true)
+
+# Sanity Check 3: Spatial alignment confirmation prior to imshow allocation
+assert true.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Ground truth matrix failed grid reshape"
+assert pred.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Prediction matrix failed grid reshape"
+assert error.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Spatial error matrix failed grid reshape"
+
+# ==========================================================
+# 8 Ground Truth
+# ==========================================================
+im = axes[2,1].imshow(true, origin="lower")
+axes[2,1].set_title("Ground Truth")
+plt.colorbar(im, ax=axes[2,1])
+
+# ==========================================================
+# 9 Prediction
+# ==========================================================
+im = axes[2,2].imshow(pred, origin="lower")
+axes[2,2].set_title("LinearNO Prediction")
+plt.colorbar(im, ax=axes[2,2])
+
+# ==========================================================
+# 10 Error
+# ==========================================================
+im = axes[3,0].imshow(error, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# ==========================================================
+# 11 Scatter
+# ==========================================================
+axes[3,1].scatter(true.flatten(), pred.flatten(), s=8)
+mn = min(true.min(), pred.min())
+mx = max(true.max(), pred.max())
+axes[3,1].plot([mn,mx], [mn,mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# ==========================================================
+# 12 Histogram
+# ==========================================================
+axes[3,2].hist(error.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save performance diagnostics plot resource under target network framework
+plt.savefig("LinearNO_All_Plots.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+print("Saved Performance Graphics Vector -> LinearNO_All_Plots.png")
+
+# ==========================================================
+# 1. Parameter Initialization & Grid Construction
+# ==========================================================
+NEW_RESOLUTION = 16
+grid_16 = create_grid(NEW_RESOLUTION).numpy().astype(np.float32)
+
+# Sanity Check 1: Verify the geometric coordinate grid configuration for resolution 16
+expected_grid_16_shape = (NEW_RESOLUTION**2, 2)  # (256, 2)
+assert grid_16.shape == expected_grid_16_shape, \
+    f"Grid 16 Shape Error: Got {list(grid_16.shape)}, expected {list(expected_grid_16_shape)}"
+
+# ==========================================================
+# 2. Field Resolution Mapping & Normalization Tracking
+# ==========================================================
+# Map raw high-resolution 64x64 tensors down to target 16x16 testing fields
+x_test_16, y_test_16 = downsample_fields(x_test, y_test, NEW_RESOLUTION)
+
+# Sanity Check 2: Confirm spatial field dimension conversions match targeted resolution
+assert x_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"x_test spatial mapping failure: {x_test_16.shape[2:]}"
+assert y_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"y_test spatial mapping failure: {y_test_16.shape[2:]}"
+
+# Normalize the 16x16 test data using the baseline 8x8 distribution parameters
+x_test_16_norm = (x_test_16 - x_mean) / x_std
+y_test_16_norm = (y_test_16 - y_mean) / y_std
+
+# Filter down to extract the exact same sample sequence tracking group
+x_test_16_sliced = x_test_16_norm[:CONFIG["test_samples"]]
+y_test_16_sliced = y_test_16_norm[:CONFIG["test_samples"]]
+
+# Sanity Check 3: Verify consistency in batch sequence length
+assert len(x_test_16_sliced) == CONFIG["test_samples"], f"Sample mismatch: Got {len(x_test_16_sliced)}"
+
+# Flatten two-dimensional spatial coordinate matrices to 1D field vectors
+branch_test_16 = x_test_16_sliced.reshape(len(x_test_16_sliced), -1).numpy().astype(np.float32)
+target_test_16 = y_test_16_sliced.reshape(len(y_test_16_sliced), -1).numpy().astype(np.float32)
+
+# Sanity Check 4: Matrix shape verification before forward pass execution
+assert branch_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Branch matrix shape error: {branch_test_16.shape}"
+assert target_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Target matrix shape error: {target_test_16.shape}"
+
+# ==========================================================
+# 3. Model Zero-Shot Forward Pass Inference Pipeline
+# ==========================================================
+best_model.eval()
+grid_tensor_16 = torch.tensor(grid_16, dtype=torch.float32).to(device)
+
+# Device sync safety check
+assert grid_tensor_16.device.type == device.type, "Device Mismatch for 16x16 grid tensor"
+
+start_inference_16 = time.time()
+with torch.no_grad():
+    branch_test_tensor_16 = torch.tensor(branch_test_16, dtype=torch.float32).to(device)
+    prediction_16 = best_model((branch_test_tensor_16, grid_tensor_16)).cpu().numpy()
+inference_time_16 = time.time() - start_inference_16
+
+# Sanity Check 5: Confirm model prediction output dimension alignment
+assert prediction_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), \
+    f"Model Output Shape Error: Got {list(prediction_16.shape)}, expected [{CONFIG['test_samples']}, {NEW_RESOLUTION**2}]"
+
+# Compute global evaluation error metrics across the 16x16 mesh grid
+prediction_torch_16 = torch.tensor(prediction_16, dtype=torch.float32)
+target_torch_16 = torch.tensor(target_test_16, dtype=torch.float32)
+
+mse_16 = criterion(prediction_torch_16, target_torch_16).item()
+l2_16 = (torch.norm(prediction_torch_16 - target_torch_16) / torch.norm(target_torch_16)).item()
+
+print(f"\n--- LinearNO Zero-Shot Resolution Evaluation Analysis ({NEW_RESOLUTION}x{NEW_RESOLUTION}) ---")
+print(f"Optimal Model Variant Employed : {best_experiment}")
+print(f"Computed Mesh Mean Squared Error (MSE)   : {mse_16:.6f}")
+print(f"Computed Mesh Relative L2 Error Score   : {l2_16:.6f}")
+print(f"Total Batch Forward Inference Latency  : {inference_time_16:.4f} seconds")
+
+# ==========================================================
+# 4. Diagnostics & Comparative Visual Plotting Engine
+# ==========================================================
+sample = 0
+true_16 = target_test_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+pred_16 = prediction_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+error_16 = np.abs(pred_16 - true_16)
+
+# Sanity Check 6: Check spatial dimensions match before grid rendering
+assert true_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "True field failed grid conversion"
+assert pred_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Predicted field failed grid conversion"
+assert error_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Spatial error field failed grid conversion"
+
+fig, axes = plt.subplots(
+    4,
+    3,
+    figsize=(24, 22)
+)
+
+# [Subplots 1 to 7]: Re-plot original historical training sweep metrics
+for key, hist in linearno_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+for key, hist in linearno_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+for key, hist in linearno_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = linearno_results_df[linearno_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# [Subplots 8 to 12]: Plot zero-shot model inference fields evaluated at 16x16 resolution
+# 8 Ground Truth Map
+im = axes[2,1].imshow(true_16, origin="lower")
+axes[2,1].set_title(f"Ground Truth ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,1])
+
+# 9 Model Prediction Field Map
+im = axes[2,2].imshow(pred_16, origin="lower")
+axes[2,2].set_title(f"LinearNO Prediction ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,2])
+
+# 10 Absolute Localized Grid Error Map
+im = axes[3,0].imshow(error_16, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# 11 Regression Scatter Comparison Matrix
+axes[3,1].scatter(true_16.flatten(), pred_16.flatten(), s=8)
+mn = min(true_16.min(), pred_16.min())
+mx = max(true_16.max(), pred_16.max())
+axes[3,1].plot([mn, mx], [mn, mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# 12 Discrepancy Density Histogram Distribution
+axes[3,2].hist(error_16.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save image profile tracking resource asset to disk
+plt.savefig(
+    "LinearNO_Resolution_16_Plots.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+print("Saved Performance Graphics Vector -> LinearNO_Resolution_16_Plots.png")
+
+class ContinuousChartNet(nn.Module):
+    """
+    CATO Continuous Coordinate Chart Network:
+    Learns a continuous nonlinear mapping phi_chart: R^d -> R^d from raw physical
+    coordinates (e.g., x, y) into a smooth, latent chart space (u, v).
+    This re-parameterizes the physical geometry to expose low-rank axial alignment.
+    """
+    def __init__(self, in_dim=2, hidden_dim=32, out_dim=2):
+        super().__init__()
+        self.chart_mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+    def forward(self, coords):
+        # coords shape: [N_nodes, 2] or [B, N_nodes, 2]
+        chart_coords = self.chart_mlp(coords)
+        return chart_coords
+
+
+class ChartedAxialAttention(nn.Module):
+    """
+    Charted Axial Attention Module:
+    Applies factorized 1D multi-head self-attentions along orthogonal chart directions
+    in the learned latent chart space. Conditioned on continuous chart positional encodings.
+    """
+    def __init__(self, embed_dim, heads=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.heads = heads
+        self.head_dim = embed_dim // heads
+
+        assert self.head_dim * heads == embed_dim, "CATO Error: embed_dim must be cleanly divisible by heads count"
+
+        # Positional coordinate projection from latent chart space
+        self.chart_pos_proj = nn.Linear(2, embed_dim)
+
+        self.attn_h = AxialMultiHeadAttention(embed_dim, heads=heads)
+        self.attn_w = AxialMultiHeadAttention(embed_dim, heads=heads)
+        self.fuse_proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, chart_coords):
+        # x shape: [B, H, W, C]
+        # chart_coords shape: [N_nodes, 2] where N_nodes = H * W
+        B, H, W, C = x.shape
+        N_nodes = H * W
+
+        # 1. Project latent continuous chart coordinates into positional embeddings
+        chart_pos_emb = self.chart_pos_proj(chart_coords) # [N_nodes, C]
+        chart_pos_emb = chart_pos_emb.view(1, H, W, C)      # [1, H, W, C]
+
+        # 2. Inject continuous chart position signals into feature map
+        x_charted = x + chart_pos_emb # [B, H, W, C]
+
+        # 3. Compute factorized axial attentions along chart axes
+        out_h = self.attn_h(x_charted, axis=1) # [B, H, W, C]
+        out_w = self.attn_w(x_charted, axis=2) # [B, H, W, C]
+
+        # 4. Fuse chart-conditioned spatial features
+        fused = torch.cat([out_h, out_w], dim=-1) # [B, H, W, 2*C]
+        out = self.norm(x + self.fuse_proj(fused))
+
+        assert out.shape == (B, H, W, C), f"Charted Axial Attention Output Error: {list(out.shape)}"
+        return out
+
+
+class CATOBlock(nn.Module):
+    """
+    CATO Transformer Block:
+    Integrates Charted Axial Attention with a pointwise Feed-Forward Network.
+    """
+    def __init__(self, embed_dim, heads=4):
+        super().__init__()
+        self.charted_attn = ChartedAxialAttention(embed_dim, heads=heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, chart_coords):
+        attn_out = self.charted_attn(x, chart_coords)
+        ffn_out = self.ffn(attn_out)
+        out = self.norm(attn_out + ffn_out)
+        return out
+
+
+class CATONet(nn.Module):
+    """
+    Charted Axial Transformer Operator (CATO):
+    Learns a continuous coordinate chart phi_chart to map physical mesh points into a
+    latent chart space, then executes chart-conditioned axial attention for fast PDE operator learning.
+    """
+    def __init__(self, node_in_channels=1, hidden_channels=64, out_channels=1, num_layers=3, heads=4):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.heads = heads
+
+        # Continuous latent geometry chart generator
+        self.chart_net = ContinuousChartNet(in_dim=2, hidden_dim=32, out_dim=2)
+
+        # Scalar field lifting layer
+        self.lifting = nn.Linear(node_in_channels, hidden_channels)
+
+        # Cascaded CATO blocks
+        self.layers = nn.ModuleList([
+            CATOBlock(embed_dim=hidden_channels, heads=heads)
+            for _ in range(num_layers)
+        ])
+
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, out_channels)
+        )
+
+    def forward(self, inputs):
+        assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, \
+            "CATONet Error: Inputs must be formatted as (x_branch, x_trunk)"
+
+        x_branch, x_trunk = inputs
+
+        if isinstance(x_branch, np.ndarray): x_branch = torch.from_numpy(x_branch).float()
+        if isinstance(x_trunk, np.ndarray): x_trunk = torch.from_numpy(x_trunk).float()
+
+        device = next(self.parameters()).device
+        x_branch = x_branch.to(device)
+        x_trunk = x_trunk.to(device)
+
+        B = x_branch.shape[0]
+        N_nodes = x_trunk.shape[0]
+
+        # Deduce grid spatial resolution H x W from total node sequence count
+        H = int(np.round(np.sqrt(N_nodes)))
+        W = H
+
+        assert H * W == N_nodes, f"CATO Resolution Error: N_nodes={N_nodes} is not a perfect square grid ({H}x{W})"
+
+        # 1. Map raw physical spatial coordinates x_trunk -> latent continuous chart coordinates
+        chart_coords = self.chart_net(x_trunk) # [N_nodes, 2]
+
+        # Sanity Check 1: Verify chart coordinate tensor dimensions
+        assert chart_coords.shape == (N_nodes, 2), f"Chart Mapping Error: Got shape {list(chart_coords.shape)}"
+
+        # 2. Lift input scalar field values to embedded hidden channels
+        h = self.lifting(x_branch.unsqueeze(-1)) # [B, N_nodes, hidden_channels]
+
+        # Reshape to 2D grid matrix representation layout for axial chart attention
+        h_grid = h.view(B, H, W, self.hidden_channels)
+
+        # 3. Process features through Charted Axial Attention blocks
+        for layer in self.layers:
+            h_grid = layer(h_grid, chart_coords)
+
+        # Sanity Check 2: Confirm grid matrix shape preservation
+        assert h_grid.shape == (B, H, W, self.hidden_channels), f"CATO Layer Processing Error: {list(h_grid.shape)}"
+
+        # Flatten spatial grid matrix back to 1D sequence layout
+        h_flat = h_grid.view(B, N_nodes, self.hidden_channels)
+
+        # 4. Project hidden representations back to predicted PDE output fields
+        out = self.projection(h_flat).squeeze(-1) # [B, N_nodes]
+
+        # Final Verification Check: Confirm output tensor shape matches ground truth target
+        assert out.shape == (B, N_nodes), f"CATO Final Output Error: Shape mismatch {list(out.shape)}"
+        return out
+
+print("CATO architectural framework successfully initialized. Continuous Charted Axial Attention active.")
+
+criterion = nn.MSELoss()
+cato_model_store = {}
+cato_histories = {}
+cato_results = []
+
+# Move coordinates grid to target hardware accelerator
+grid_tensor = torch.tensor(grid, dtype=torch.float32).to(device)
+
+# Sanity Check 1: Verify grid coordinate device type matches hardware setup
+assert grid_tensor.device.type == device.type, \
+    f"Hardware Sync Error: grid_tensor on {grid_tensor.device}, expected {device}"
+assert grid_tensor.shape == (WORKING_RESOLUTION**2, 2), \
+    f"Grid Dimension Error: Got {list(grid_tensor.shape)}"
+
+for epochs in CONFIG["epochs_list"]:
+    for lr in CONFIG["learning_rates"]:
+        print("=" * 70)
+        print(f"Training CATO Engine | Target Epochs={epochs} | Learning Rate={lr}")
+        print("=" * 70)
+
+        # Initialize CATO network architecture
+        net = CATONet(
+            node_in_channels=1,
+            hidden_channels=64,
+            out_channels=1,
+            num_layers=3,
+            heads=4
+        ).to(device)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+        # Performance tracking registries
+        steps_hist = []
+        train_loss_hist = []
+        test_loss_hist = []
+        test_metric_hist = []
+
+        start_train = time.time()
+
+        for epoch in range(1, epochs + 1):
+            net.train()
+            total_train_loss = 0.0
+
+            for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                # Sanity Check 2: Dynamic batch feature entry dimension validation
+                current_batch_size = batch_x.size(0)
+                assert batch_x.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Input Mismatch: Got {list(batch_x.shape)}"
+                assert batch_y.shape == (current_batch_size, WORKING_RESOLUTION**2), \
+                    f"Train Batch Target Mismatch: Got {list(batch_y.shape)}"
+
+                optimizer.zero_grad()
+
+                # Execute CATO charted axial attention forward pass
+                pred = net((batch_x, grid_tensor))
+
+                # Sanity Check 3: Output tensor dimension synchronization check
+                assert pred.shape == batch_y.shape, \
+                    f"Loss Engine Dimension Collision: Pred {list(pred.shape)} != Target {list(batch_y.shape)}"
+
+                loss = criterion(pred, batch_y)
+                loss.backward()
+                optimizer.step()
+
+                total_train_loss += loss.item() * current_batch_size
+
+            avg_train_loss = total_train_loss / len(train_loader.dataset)
+
+            # Validation / Testing Evaluation Sequence
+            net.eval()
+            total_test_loss = 0.0
+            total_test_l2 = 0.0
+
+            with torch.no_grad():
+                for batch_x, batch_y in test_loader:
+                    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+                    pred = net((batch_x, grid_tensor))
+
+                    loss = criterion(pred, batch_y)
+                    total_test_loss += loss.item() * batch_x.size(0)
+
+                    # Compute Relative L2 normalization mismatch
+                    l2_err = torch.norm(pred - batch_y) / torch.norm(batch_y)
+                    total_test_l2 += l2_err.item() * batch_x.size(0)
+
+            avg_test_loss = total_test_loss / len(test_loader.dataset)
+            avg_test_l2 = total_test_l2 / len(test_loader.dataset)
+
+            steps_hist.append(epoch)
+            train_loss_hist.append(avg_train_loss)
+            test_loss_hist.append(avg_test_loss)
+            test_metric_hist.append(avg_test_l2)
+
+            if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
+                print(f"Epoch {epoch:03d}/{epochs:03d} | Train MSE: {avg_train_loss:.6f} | Test MSE: {avg_test_loss:.6f} | Relative L2: {avg_test_l2:.6f}")
+
+        training_time = time.time() - start_train
+
+        # Final Batch Inference Latency Benchmark
+        start_test = time.time()
+        net.eval()
+        with torch.no_grad():
+            branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+            prediction = net((branch_test_tensor, grid_tensor)).cpu().numpy()
+        inference_time = time.time() - start_test
+
+        # Sanity Check 4: Validate full out-of-sample prediction block structure
+        assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+            f"Inference Mapping Shape Mismatch: Got {list(prediction.shape)}"
+
+        prediction_torch = torch.tensor(prediction, dtype=torch.float32)
+        target_torch = torch.tensor(target_test, dtype=torch.float32)
+
+        final_mse = criterion(prediction_torch, target_torch).item()
+        final_l2 = (torch.norm(prediction_torch - target_torch) / torch.norm(target_torch)).item()
+
+        # Update core global state tracking dictionaries with pure CATO namespaces
+        key = f"E{epochs}_LR{lr}"
+        cato_model_store[key] = net
+        cato_histories[key] = {
+            "epochs": epochs,
+            "learning_rate": lr,
+            "steps": np.array(steps_hist),
+            "train_loss": np.array(train_loss_hist),
+            "test_loss": np.array(test_loss_hist),
+            "test_metric": np.array(test_metric_hist)
+        }
+
+        cato_results.append({
+            "experiment": key,
+            "epochs": epochs,
+            "learning_rate": lr,
+            "training_time": training_time,
+            "inference_time": inference_time,
+            "train_error": train_loss_hist[-1],
+            "test_error": test_loss_hist[-1],
+            "test_mse": final_mse,
+            "test_l2": final_l2
+        })
+
+print("\nCATO Hyperparameter execution sweep completed successfully.")
+cato_results_df = pd.DataFrame(cato_results)
+display(cato_results_df)
+
+# Verify dataframe populate states prior to extraction
+assert not cato_results_df.empty, "Plotting Error: cato_results_df dataframe is empty, sweep execution failed"
+assert len(cato_model_store) > 0, "Plotting Error: cato_model_store possesses zero compiled model instances"
+
+# Retrieve best model configuration using minimum relative test L2 error index
+best_idx = cato_results_df["test_l2"].idxmin()
+best_experiment = cato_results_df.loc[best_idx, "experiment"]
+best_model = cato_model_store[best_experiment]
+best_history = cato_histories[best_experiment]
+
+# Sanity Check 1: Explicitly verify structural integrity of retrieved optimal model historical records
+assert "steps" in best_history and "train_loss" in best_history, "Plotting Error: History trace tracking variables corrupted"
+print("Optimal Hyperparameter Profile Designated:", best_experiment)
+
+epochs_axis = best_history["steps"]
+train_total_loss = best_history["train_loss"]
+test_total_loss = best_history["test_loss"]
+test_l2_history = best_history["test_metric"]
+
+# Set up canvas layout matching user layout parameters exactly
+fig, axes = plt.subplots(4, 3, figsize=(24, 22))
+
+# ==========================================================
+# 1 Training Loss
+# ==========================================================
+for key, hist in cato_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+# ==========================================================
+# 2 Test Loss
+# ==========================================================
+for key, hist in cato_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+# ==========================================================
+# 3 Relative L2
+# ==========================================================
+for key, hist in cato_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+# ==========================================================
+# 4 Training Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+# ==========================================================
+# 5 Inference Time
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+# ==========================================================
+# 6 Train Error
+# ==========================================================
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+# ==========================================================
+# 7 Test Error
+# ==========================================================
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# ==========================================================
+# Best Field Map Prediction Calculations
+# ==========================================================
+best_model.eval()
+with torch.no_grad():
+    branch_test_tensor = torch.tensor(branch_test, dtype=torch.float32).to(device)
+    prediction = best_model((branch_test_tensor, grid_tensor)).cpu().numpy()
+
+# Sanity Check 2: Confirm prediction maps match exact batch bounds
+assert prediction.shape == (CONFIG["test_samples"], WORKING_RESOLUTION**2), \
+    f"Evaluation Error: Output field predictions shape matrix mismatch: {list(prediction.shape)}"
+
+sample = 0
+true = target_test[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+pred = prediction[sample].reshape(WORKING_RESOLUTION, WORKING_RESOLUTION)
+error = np.abs(pred - true)
+
+# Sanity Check 3: Spatial alignment confirmation prior to imshow allocation
+assert true.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Ground truth matrix failed grid reshape"
+assert pred.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Prediction matrix failed grid reshape"
+assert error.shape == (WORKING_RESOLUTION, WORKING_RESOLUTION), "Shape Error: Spatial error matrix failed grid reshape"
+
+# ==========================================================
+# 8 Ground Truth
+# ==========================================================
+im = axes[2,1].imshow(true, origin="lower")
+axes[2,1].set_title("Ground Truth")
+plt.colorbar(im, ax=axes[2,1])
+
+# ==========================================================
+# 9 Prediction
+# ==========================================================
+im = axes[2,2].imshow(pred, origin="lower")
+axes[2,2].set_title("CATO Prediction")
+plt.colorbar(im, ax=axes[2,2])
+
+# ==========================================================
+# 10 Error
+# ==========================================================
+im = axes[3,0].imshow(error, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# ==========================================================
+# 11 Scatter
+# ==========================================================
+axes[3,1].scatter(true.flatten(), pred.flatten(), s=8)
+mn = min(true.min(), pred.min())
+mx = max(true.max(), pred.max())
+axes[3,1].plot([mn,mx], [mn,mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# ==========================================================
+# 12 Histogram
+# ==========================================================
+axes[3,2].hist(error.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save performance diagnostics plot resource under target network framework
+plt.savefig("CATO_All_Plots.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+print("Saved Performance Graphics Vector -> CATO_All_Plots.png")
+
+# ==========================================================
+# 1. Parameter Initialization & Grid Construction
+# ==========================================================
+NEW_RESOLUTION = 16
+grid_16 = create_grid(NEW_RESOLUTION).numpy().astype(np.float32)
+
+# Sanity Check 1: Verify the geometric coordinate grid configuration for resolution 16
+expected_grid_16_shape = (NEW_RESOLUTION**2, 2)  # (256, 2)
+assert grid_16.shape == expected_grid_16_shape, \
+    f"Grid 16 Shape Error: Got {list(grid_16.shape)}, expected {list(expected_grid_16_shape)}"
+
+# ==========================================================
+# 2. Field Resolution Mapping & Normalization Tracking
+# ==========================================================
+# Map raw high-resolution 64x64 tensors down to target 16x16 testing fields
+x_test_16, y_test_16 = downsample_fields(x_test, y_test, NEW_RESOLUTION)
+
+# Sanity Check 2: Confirm spatial field dimension conversions match targeted resolution
+assert x_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"x_test spatial mapping failure: {x_test_16.shape[2:]}"
+assert y_test_16.shape[2:] == (NEW_RESOLUTION, NEW_RESOLUTION), f"y_test spatial mapping failure: {y_test_16.shape[2:]}"
+
+# Normalize the 16x16 test data using the baseline 8x8 distribution parameters
+x_test_16_norm = (x_test_16 - x_mean) / x_std
+y_test_16_norm = (y_test_16 - y_mean) / y_std
+
+# Filter down to extract the exact same sample sequence tracking group
+x_test_16_sliced = x_test_16_norm[:CONFIG["test_samples"]]
+y_test_16_sliced = y_test_16_norm[:CONFIG["test_samples"]]
+
+# Sanity Check 3: Verify consistency in batch sequence length
+assert len(x_test_16_sliced) == CONFIG["test_samples"], f"Sample mismatch: Got {len(x_test_16_sliced)}"
+
+# Flatten two-dimensional spatial coordinate matrices to 1D field vectors
+branch_test_16 = x_test_16_sliced.reshape(len(x_test_16_sliced), -1).numpy().astype(np.float32)
+target_test_16 = y_test_16_sliced.reshape(len(y_test_16_sliced), -1).numpy().astype(np.float32)
+
+# Sanity Check 4: Matrix shape verification before forward pass execution
+assert branch_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Branch matrix shape error: {branch_test_16.shape}"
+assert target_test_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), f"Target matrix shape error: {target_test_16.shape}"
+
+# ==========================================================
+# 3. Model Zero-Shot Forward Pass Inference Pipeline
+# ==========================================================
+best_model.eval()
+grid_tensor_16 = torch.tensor(grid_16, dtype=torch.float32).to(device)
+
+# Device sync safety check
+assert grid_tensor_16.device.type == device.type, "Device Mismatch for 16x16 grid tensor"
+
+start_inference_16 = time.time()
+with torch.no_grad():
+    branch_test_tensor_16 = torch.tensor(branch_test_16, dtype=torch.float32).to(device)
+    prediction_16 = best_model((branch_test_tensor_16, grid_tensor_16)).cpu().numpy()
+inference_time_16 = time.time() - start_inference_16
+
+# Sanity Check 5: Confirm model prediction output dimension alignment
+assert prediction_16.shape == (CONFIG["test_samples"], NEW_RESOLUTION**2), \
+    f"Model Output Shape Error: Got {list(prediction_16.shape)}, expected [{CONFIG['test_samples']}, {NEW_RESOLUTION**2}]"
+
+# Compute global evaluation error metrics across the 16x16 mesh grid
+prediction_torch_16 = torch.tensor(prediction_16, dtype=torch.float32)
+target_torch_16 = torch.tensor(target_test_16, dtype=torch.float32)
+
+mse_16 = criterion(prediction_torch_16, target_torch_16).item()
+l2_16 = (torch.norm(prediction_torch_16 - target_torch_16) / torch.norm(target_torch_16)).item()
+
+print(f"\n--- CATO Zero-Shot Resolution Evaluation Analysis ({NEW_RESOLUTION}x{NEW_RESOLUTION}) ---")
+print(f"Optimal Model Variant Employed : {best_experiment}")
+print(f"Computed Mesh Mean Squared Error (MSE)   : {mse_16:.6f}")
+print(f"Computed Mesh Relative L2 Error Score   : {l2_16:.6f}")
+print(f"Total Batch Forward Inference Latency  : {inference_time_16:.4f} seconds")
+
+# ==========================================================
+# 4. Diagnostics & Comparative Visual Plotting Engine
+# ==========================================================
+sample = 0
+true_16 = target_test_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+pred_16 = prediction_16[sample].reshape(NEW_RESOLUTION, NEW_RESOLUTION)
+error_16 = np.abs(pred_16 - true_16)
+
+# Sanity Check 6: Check spatial dimensions match before grid rendering
+assert true_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "True field failed grid conversion"
+assert pred_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Predicted field failed grid conversion"
+assert error_16.shape == (NEW_RESOLUTION, NEW_RESOLUTION), "Spatial error field failed grid conversion"
+
+fig, axes = plt.subplots(
+    4,
+    3,
+    figsize=(24, 22)
+)
+
+# [Subplots 1 to 7]: Re-plot original historical training sweep metrics
+for key, hist in cato_histories.items():
+    axes[0,0].plot(hist["steps"], hist["train_loss"], label=key)
+axes[0,0].set_title("Training Loss")
+axes[0,0].set_xlabel("Epoch")
+axes[0,0].set_ylabel("Loss")
+axes[0,0].legend(fontsize=6)
+
+for key, hist in cato_histories.items():
+    axes[0,1].plot(hist["steps"], hist["test_loss"], label=key)
+axes[0,1].set_title("Test Loss")
+axes[0,1].set_xlabel("Epoch")
+axes[0,1].set_ylabel("Loss")
+axes[0,1].legend(fontsize=6)
+
+for key, hist in cato_histories.items():
+    axes[0,2].plot(hist["steps"], hist["test_metric"], label=key)
+axes[0,2].set_title("Relative L2 Error")
+axes[0,2].set_xlabel("Epoch")
+axes[0,2].legend(fontsize=6)
+
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,0].plot(subset["epochs"], subset["training_time"], marker="o", label=f"lr={lr}")
+axes[1,0].set_title("Training Time")
+axes[1,0].set_xlabel("Epochs")
+axes[1,0].set_ylabel("Seconds")
+axes[1,0].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,1].plot(subset["epochs"], subset["inference_time"], marker="o", label=f"lr={lr}")
+axes[1,1].set_title("Inference Time")
+axes[1,1].set_xlabel("Epochs")
+axes[1,1].set_ylabel("Seconds")
+axes[1,1].legend()
+
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    axes[1,2].plot(subset["epochs"], subset["train_error"], marker="o", label=f"lr={lr}")
+axes[1,2].set_title("Train Error")
+axes[1,2].set_xlabel("Epochs")
+axes[1,2].legend()
+
+ax = fig.add_subplot(4,3,7)
+for lr in CONFIG["learning_rates"]:
+    subset = cato_results_df[cato_results_df.learning_rate == lr].sort_values("epochs")
+    ax.plot(subset["epochs"], subset["test_error"], marker="o", label=f"lr={lr}")
+ax.set_title("Test Error")
+ax.set_xlabel("Epochs")
+ax.legend()
+
+# [Subplots 8 to 12]: Plot zero-shot model inference fields evaluated at 16x16 resolution
+# 8 Ground Truth Map
+im = axes[2,1].imshow(true_16, origin="lower")
+axes[2,1].set_title(f"Ground Truth ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,1])
+
+# 9 Model Prediction Field Map
+im = axes[2,2].imshow(pred_16, origin="lower")
+axes[2,2].set_title(f"CATO Prediction ({NEW_RESOLUTION}x{NEW_RESOLUTION})")
+plt.colorbar(im, ax=axes[2,2])
+
+# 10 Absolute Localized Grid Error Map
+im = axes[3,0].imshow(error_16, origin="lower")
+axes[3,0].set_title("Absolute Error")
+plt.colorbar(im, ax=axes[3,0])
+
+# 11 Regression Scatter Comparison Matrix
+axes[3,1].scatter(true_16.flatten(), pred_16.flatten(), s=8)
+mn = min(true_16.min(), pred_16.min())
+mx = max(true_16.max(), pred_16.max())
+axes[3,1].plot([mn, mx], [mn, mx], "r--")
+axes[3,1].set_title("Prediction vs Truth")
+
+# 12 Discrepancy Density Histogram Distribution
+axes[3,2].hist(error_16.flatten(), bins=30)
+axes[3,2].set_title("Error Histogram")
+
+plt.tight_layout()
+
+# Save image profile tracking resource asset to disk
+plt.savefig(
+    "CATO_Resolution_16_Plots.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+print("Saved Performance Graphics Vector -> CATO_Resolution_16_Plots.png")
