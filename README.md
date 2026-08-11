@@ -1,4 +1,4 @@
-# Indian-Statistical-Institute-Summer-School-Project
+# Indian Statistical Institute:-Summer-School-Project
 Scientific Machine Learning For Computational Physics Neural Operator Benchmarking on Darcy Flow Resolution Generalization
 
 ## code1.py
